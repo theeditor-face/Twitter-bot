@@ -1,0 +1,175 @@
+import os
+import json
+import requests
+import tempfile
+import feedparser
+from datetime import datetime, timezone
+import tweepy
+
+# ── Twitter Keys (from GitHub Secrets) ────────────────────────────────────────
+TW_API_KEY      = os.getenv("TWITTER_API_KEY")
+TW_API_SECRET   = os.getenv("TWITTER_API_SECRET")
+TW_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
+TW_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
+
+POSTED_FILE = "posted.json"
+
+# ── Free Cybersecurity News Feeds ──────────────────────────────────────────────
+RSS_FEEDS = [
+    "https://feeds.feedburner.com/TheHackersNews",
+    "https://www.bleepingcomputer.com/feed/",
+    "https://krebsonsecurity.com/feed/",
+    "https://threatpost.com/feed/",
+]
+
+# ── Load/Save Posted Log ───────────────────────────────────────────────────────
+def load_posted():
+    if os.path.exists(POSTED_FILE):
+        with open(POSTED_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_posted(data):
+    with open(POSTED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ── Fetch Latest News ──────────────────────────────────────────────────────────
+def fetch_latest_news():
+    articles = []
+    for feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:3]:
+                articles.append({
+                    "title": entry.get("title", ""),
+                    "summary": entry.get("summary", entry.get("description", ""))[:500],
+                    "link": entry.get("link", ""),
+                    "source": feed.feed.get("title", feed_url)
+                })
+        except Exception as e:
+            print(f"Feed error: {e}")
+    return articles[:15]
+
+# ── Get Unposted Article ───────────────────────────────────────────────────────
+def get_unposted_article(articles, posted_log):
+    posted_links = [p.get("link") for p in posted_log]
+    for article in articles:
+        if article["link"] not in posted_links:
+            return article
+    return None
+
+# ── Generate Tweet Text (Free Pollinations AI, No Key Needed) ─────────────────
+def generate_tweet(article):
+    try:
+        prompt = (
+            f"Write a short engaging Twitter post about this cybersecurity news for the account @ETHDENT_HOP. "
+            f"Title: {article['title']}. "
+            f"Summary: {article['summary'][:300]}. "
+            f"Rules: max 220 characters, include 2 hashtags like #CyberSecurity #InfoSec, "
+            f"sound urgent and informative, return only the tweet text nothing else."
+        )
+        encoded = requests.utils.quote(prompt, safe='')
+        response = requests.get(
+            f"https://text.pollinations.ai/{encoded}?model=llama3",
+            timeout=30
+        )
+        if response.status_code == 200:
+            return response.text.strip().strip('"').strip("'")
+        raise Exception("AI text failed")
+    except Exception as e:
+        print(f"Tweet generation fallback: {e}")
+        return f"🔐 {article['title'][:180]} #CyberSecurity #InfoSec"
+
+# ── Generate Image (Free Pollinations, No Key Needed) ─────────────────────────
+def generate_image(article_title):
+    try:
+        image_prompt = (
+            f"cybersecurity digital art about: {article_title[:100]}, "
+            "dark background, glowing blue and red neon, hacker aesthetic, "
+            "shield lock symbols, matrix code, professional tech art, no text"
+        )
+        encoded = requests.utils.quote(image_prompt, safe='')
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1200&height=675&nologo=true"
+        resp = requests.get(url, timeout=45)
+        if resp.status_code == 200 and len(resp.content) > 5000:
+            fd, path = tempfile.mkstemp(suffix=".jpg")
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(resp.content)
+            return path
+    except Exception as e:
+        print(f"Image error: {e}")
+    return None
+
+# ── Twitter Client ─────────────────────────────────────────────────────────────
+def get_twitter_clients():
+    client = tweepy.Client(
+        consumer_key=TW_API_KEY,
+        consumer_secret=TW_API_SECRET,
+        access_token=TW_ACCESS_TOKEN,
+        access_token_secret=TW_ACCESS_SECRET,
+        wait_on_rate_limit=True
+    )
+    auth = tweepy.OAuth1UserHandler(TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
+    api_v1 = tweepy.API(auth, wait_on_rate_limit=True)
+    return client, api_v1
+
+# ── Main Run ───────────────────────────────────────────────────────────────────
+def run():
+    print(f"Bot started: {datetime.now(timezone.utc).isoformat()}")
+
+    posted_log = load_posted()
+    articles = fetch_latest_news()
+
+    if not articles:
+        print("No articles found. Exiting.")
+        return
+
+    article = get_unposted_article(articles, posted_log)
+    if not article:
+        print("All articles posted before. Resetting log.")
+        posted_log = []
+        article = articles[0]
+
+    print(f"Article: {article['title']}")
+
+    # Generate tweet
+    tweet_text = generate_tweet(article)
+    full_tweet = f"{tweet_text}\n\n{article['link']}"
+    if len(full_tweet) > 275:
+        full_tweet = f"{tweet_text[:200]}...\n\n{article['link']}"
+    print(f"Tweet:\n{full_tweet}")
+
+    # Generate image
+    image_path = generate_image(article["title"])
+
+    # Post to Twitter
+    try:
+        client, api_v1 = get_twitter_clients()
+        media_id = None
+
+        if image_path and os.path.exists(image_path):
+            media = api_v1.media_upload(image_path)
+            media_id = media.media_id_string
+            os.remove(image_path)
+
+        response = client.create_tweet(
+            text=full_tweet,
+            media_ids=[media_id] if media_id else None
+        )
+
+        tweet_id = response.data.get("id") if response.data else "unknown"
+        print(f"✅ Posted! Tweet ID: {tweet_id}")
+
+        posted_log.append({
+            "link": article["link"],
+            "title": article["title"],
+            "tweet_id": tweet_id,
+            "posted_at": datetime.now(timezone.utc).isoformat()
+        })
+        save_posted(posted_log)
+
+    except Exception as e:
+        print(f"❌ Failed to post: {e}")
+
+if __name__ == "__main__":
+    run()
